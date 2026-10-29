@@ -1,8 +1,11 @@
+
 from flask import Flask, render_template, request
 from analyzer import predict_job
 import sqlite3
 from datetime import datetime
+from contextlib import closing
 import os
+import logging
 
 
 # =========================================================
@@ -11,7 +14,15 @@ import os
 
 app = Flask(__name__)
 
-DATABASE = "database/history.db"
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+LOGGER = logging.getLogger(__name__)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE = os.environ.get(
+    "JOBGUARD_DATABASE_PATH",
+    os.path.join(BASE_DIR, "database", "history.db"),
+)
+DATABASE_DIR = os.path.dirname(os.path.abspath(DATABASE))
 
 
 # =========================================================
@@ -19,29 +30,29 @@ DATABASE = "database/history.db"
 # =========================================================
 
 def init_database():
+    """Create the database directory and scans table if needed."""
 
-    # Create database folder if it does not exist
-    
-    os.makedirs("database", exist_ok=True)
+    os.makedirs(DATABASE_DIR, exist_ok=True)
 
-    conn = sqlite3.connect(DATABASE)
+    with closing(sqlite3.connect(DATABASE)) as conn:
+        with conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_description TEXT NOT NULL,
+                    prediction TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    risk_score INTEGER NOT NULL,
+                    risk_level TEXT NOT NULL,
+                    scan_time TEXT NOT NULL
+                )
+            """)
 
-    cursor = conn.cursor()
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS scans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_description TEXT NOT NULL,
-            prediction TEXT NOT NULL,
-            confidence REAL NOT NULL,
-            risk_score INTEGER NOT NULL,
-            risk_level TEXT NOT NULL,
-            scan_time TEXT NOT NULL
-        )
-    """)
-
-    conn.commit()
-    conn.close()
+# IMPORTANT:
+# Gunicorn imports this module instead of running it as __main__.
+# Therefore, initialize the database during module import.
+init_database()
 
 
 # =========================================================
@@ -55,35 +66,30 @@ def save_scan(
     risk_score,
     risk_level
 ):
+    """Save an analyzed job description and its results."""
 
-    conn = sqlite3.connect(DATABASE)
-    cursor = conn.cursor()
+    scan_time = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
 
-    scan_time = datetime.now().strftime(
-        "%d-%m-%Y %H:%M:%S"
-    )
-
-    cursor.execute("""
-        INSERT INTO scans (
-            job_description,
-            prediction,
-            confidence,
-            risk_score,
-            risk_level,
-            scan_time
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        job_description,
-        prediction,
-        confidence,
-        risk_score,
-        risk_level,
-        scan_time
-    ))
-
-    conn.commit()
-    conn.close()
+    with closing(sqlite3.connect(DATABASE)) as conn:
+        with conn:
+            conn.execute("""
+                INSERT INTO scans (
+                    job_description,
+                    prediction,
+                    confidence,
+                    risk_score,
+                    risk_level,
+                    scan_time
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                job_description,
+                prediction,
+                confidence,
+                risk_score,
+                risk_level,
+                scan_time
+            ))
 
 
 # =========================================================
@@ -95,78 +101,38 @@ def get_history(
     prediction_filter="",
     risk_filter=""
 ):
+    """Retrieve scan history with optional filters."""
 
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
+    with closing(sqlite3.connect(DATABASE)) as conn:
+        conn.row_factory = sqlite3.Row
 
-    cursor = conn.cursor()
-
-    query = """
-        SELECT *
-        FROM scans
-        WHERE 1=1
-    """
-
-    params = []
-
-    # -----------------------------------------------------
-    # SEARCH FILTER
-    # -----------------------------------------------------
-
-    if search:
-
-        query += """
-            AND job_description LIKE ?
+        query = """
+            SELECT *
+            FROM scans
+            WHERE 1=1
         """
 
-        params.append(
-            "%" + search + "%"
-        )
+        params = []
 
-    # -----------------------------------------------------
-    # PREDICTION FILTER
-    # -----------------------------------------------------
+        # Search job descriptions
+        if search:
+            query += " AND job_description LIKE ?"
+            params.append("%" + search + "%")
 
-    if prediction_filter:
+        # Filter by prediction
+        if prediction_filter:
+            query += " AND UPPER(prediction) = UPPER(?)"
+            params.append(prediction_filter)
 
-        query += """
-            AND UPPER(prediction) = UPPER(?)
-        """
+        # Filter by risk level
+        if risk_filter:
+            query += " AND UPPER(risk_level) = UPPER(?)"
+            params.append(risk_filter)
 
-        params.append(
-            prediction_filter
-        )
+        query += " ORDER BY id DESC"
 
-    # -----------------------------------------------------
-    # RISK FILTER
-    # -----------------------------------------------------
-
-    if risk_filter:
-
-        query += """
-            AND UPPER(risk_level) = UPPER(?)
-        """
-
-        params.append(
-            risk_filter
-        )
-
-    # -----------------------------------------------------
-    # ORDER
-    # -----------------------------------------------------
-
-    query += """
-        ORDER BY id DESC
-    """
-
-    cursor.execute(
-        query,
-        params
-    )
-
-    history = cursor.fetchall()
-
-    conn.close()
+        cursor = conn.execute(query, params)
+        history = cursor.fetchall()
 
     return history
 
@@ -176,158 +142,98 @@ def get_history(
 # =========================================================
 
 def get_dashboard_stats():
+    """Calculate statistics and retrieve the latest five scans."""
 
-    conn = sqlite3.connect(DATABASE)
+    with closing(sqlite3.connect(DATABASE)) as conn:
+        conn.row_factory = sqlite3.Row
 
-    # IMPORTANT:
-    # Allows dashboard.html to access database rows
-    # using scan["id"], scan["prediction"], etc.
-    conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
 
-    cursor = conn.cursor()
+        # Total scans
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM scans
+        """)
+        total_scans = cursor.fetchone()[0]
 
-    # -----------------------------------------------------
-    # TOTAL SCANS
-    # -----------------------------------------------------
+        # Fake jobs
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM scans
+            WHERE UPPER(prediction) = 'FAKE'
+        """)
+        fake_jobs = cursor.fetchone()[0]
 
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM scans
-    """)
+        # Real jobs
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM scans
+            WHERE UPPER(prediction) = 'REAL'
+        """)
+        real_jobs = cursor.fetchone()[0]
 
-    total_scans = cursor.fetchone()[0]
+        # High-risk jobs
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM scans
+            WHERE UPPER(risk_level) = 'HIGH RISK'
+        """)
+        high_risk = cursor.fetchone()[0]
 
-    # -----------------------------------------------------
-    # FAKE JOBS
-    # -----------------------------------------------------
+        # Medium-risk jobs
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM scans
+            WHERE UPPER(risk_level) = 'MEDIUM RISK'
+        """)
+        medium_risk = cursor.fetchone()[0]
 
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM scans
-        WHERE UPPER(prediction) = 'FAKE'
-    """)
+        # Low-risk jobs
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM scans
+            WHERE UPPER(risk_level) = 'LOW RISK'
+        """)
+        low_risk = cursor.fetchone()[0]
 
-    fake_jobs = cursor.fetchone()[0]
+        # Average risk score
+        cursor.execute("""
+            SELECT AVG(risk_score)
+            FROM scans
+        """)
+        average_risk = cursor.fetchone()[0]
 
-    # -----------------------------------------------------
-    # REAL JOBS
-    # -----------------------------------------------------
+        if average_risk is None:
+            average_risk = 0
 
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM scans
-        WHERE UPPER(prediction) = 'REAL'
-    """)
+        # Average ML confidence
+        cursor.execute("""
+            SELECT AVG(confidence)
+            FROM scans
+        """)
+        average_confidence = cursor.fetchone()[0]
 
-    real_jobs = cursor.fetchone()[0]
+        if average_confidence is None:
+            average_confidence = 0
 
-    # -----------------------------------------------------
-    # HIGH RISK
-    # -----------------------------------------------------
-
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM scans
-        WHERE UPPER(risk_level) = 'HIGH RISK'
-    """)
-
-    high_risk = cursor.fetchone()[0]
-
-    # -----------------------------------------------------
-    # MEDIUM RISK
-    # -----------------------------------------------------
-
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM scans
-        WHERE UPPER(risk_level) = 'MEDIUM RISK'
-    """)
-
-    medium_risk = cursor.fetchone()[0]
-
-    # -----------------------------------------------------
-    # LOW RISK
-    # -----------------------------------------------------
-
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM scans
-        WHERE UPPER(risk_level) = 'LOW RISK'
-    """)
-
-    low_risk = cursor.fetchone()[0]
-
-    # -----------------------------------------------------
-    # AVERAGE RISK SCORE
-    # -----------------------------------------------------
-
-    cursor.execute("""
-        SELECT AVG(risk_score)
-        FROM scans
-    """)
-
-    average_risk = cursor.fetchone()[0]
-
-    if average_risk is None:
-        average_risk = 0
-
-    # -----------------------------------------------------
-    # AVERAGE ML CONFIDENCE
-    # -----------------------------------------------------
-
-    cursor.execute("""
-        SELECT AVG(confidence)
-        FROM scans
-    """)
-
-    average_confidence = cursor.fetchone()[0]
-
-    if average_confidence is None:
-        average_confidence = 0
-
-    # -----------------------------------------------------
-    # LATEST FIVE SCANS
-    # -----------------------------------------------------
-
-    cursor.execute("""
-        SELECT *
-        FROM scans
-        ORDER BY id DESC
-        LIMIT 5
-    """)
-
-    latest_scans = cursor.fetchall()
-
-    conn.close()
-
-    # -----------------------------------------------------
-    # RETURN DASHBOARD DATA
-    # -----------------------------------------------------
+        # Latest five scans
+        cursor.execute("""
+            SELECT *
+            FROM scans
+            ORDER BY id DESC
+            LIMIT 5
+        """)
+        latest_scans = cursor.fetchall()
 
     return {
-
         "total_scans": total_scans,
-
         "fake_jobs": fake_jobs,
-
         "real_jobs": real_jobs,
-
         "high_risk": high_risk,
-
         "medium_risk": medium_risk,
-
         "low_risk": low_risk,
-
-        "average_risk": round(
-            average_risk,
-            2
-        ),
-
-        "average_confidence": round(
-            average_confidence,
-            2
-        ),
-
+        "average_risk": round(average_risk, 2),
+        "average_confidence": round(average_confidence, 2),
         "latest_scans": latest_scans
     }
 
@@ -336,10 +242,7 @@ def get_dashboard_stats():
 # HOME / JOB ANALYZER
 # =========================================================
 
-@app.route(
-    "/",
-    methods=["GET", "POST"]
-)
+@app.route("/", methods=["GET", "POST"])
 def home():
 
     result = None
@@ -351,34 +254,19 @@ def home():
             ""
         ).strip()
 
-        # -------------------------------------------------
-        # EMPTY INPUT CHECK
-        # -------------------------------------------------
-
+        # Empty input check
         if not job_description:
-
             result = {
                 "error": "Please enter a job description."
             }
 
             return render_template(
-                "index.html",
-                result=result
+                "index.html", result=result, job_description=""
             )
-
-        # -------------------------------------------------
-        # ANALYZE JOB
-        # -------------------------------------------------
 
         try:
-
-            analysis = predict_job(
-                job_description
-            )
-
-            # -------------------------------------------------
-            # RESULT DATA
-            # -------------------------------------------------
+            # Analyze job description using the ML model
+            analysis = predict_job(job_description)
 
             prediction = analysis.get(
                 "prediction",
@@ -405,10 +293,7 @@ def home():
                 []
             )
 
-            # -------------------------------------------------
-            # SAVE RESULT TO DATABASE
-            # -------------------------------------------------
-
+            # Save result in SQLite
             save_scan(
                 job_description,
                 prediction,
@@ -417,32 +302,37 @@ def home():
                 risk_level
             )
 
-            # -------------------------------------------------
-            # RESULT FOR TEMPLATE
-            # -------------------------------------------------
-
+            # Prepare result for index.html
             result = {
-
                 "prediction": prediction,
-
                 "confidence": confidence,
-
                 "risk_score": risk_score,
-
                 "risk_level": risk_level,
-
                 "red_flags": red_flags
             }
 
-        except Exception as e:
+        except (ValueError, RuntimeError):
+            LOGGER.exception("Job analysis failed")
 
             result = {
-                "error": str(e)
+                "error": (
+                    "Unable to analyze this job description. "
+                    "Please try again with a valid job description."
+                )
+            }
+        except sqlite3.Error:
+            LOGGER.exception("Scan could not be saved")
+            result = {
+                "error": (
+                    "The analysis completed, but the result could not be saved. "
+                    "Please try again."
+                )
             }
 
     return render_template(
         "index.html",
-        result=result
+        result=result,
+        job_description=job_description if request.method == "POST" else "",
     )
 
 
@@ -453,26 +343,24 @@ def home():
 @app.route("/history")
 def history():
 
-    search = request.args.get(
-        "search",
-        ""
-    ).strip()
+    search = request.args.get("search", "").strip()
+    prediction_filter = request.args.get("prediction", "").strip()
+    risk_filter = request.args.get("risk", "").strip()
 
-    prediction_filter = request.args.get(
-        "prediction",
-        ""
-    ).strip()
+    if prediction_filter.upper() == "ALL":
+        prediction_filter = ""
+    if risk_filter.upper() == "ALL":
+        risk_filter = ""
 
-    risk_filter = request.args.get(
-        "risk",
-        ""
-    ).strip()
-
-    scans = get_history(
-        search=search,
-        prediction_filter=prediction_filter,
-        risk_filter=risk_filter
-    )
+    try:
+        scans = get_history(
+            search=search,
+            prediction_filter=prediction_filter,
+            risk_filter=risk_filter
+        )
+    except sqlite3.Error:
+        LOGGER.exception("Could not retrieve scan history")
+        return "Scan history is temporarily unavailable.", 503
 
     return render_template(
         "history.html",
@@ -487,56 +375,41 @@ def history():
 # SCAN DETAILS
 # =========================================================
 
-@app.route(
-    "/scan/<int:scan_id>"
-)
+@app.route("/scan/<int:scan_id>")
 def scan_details(scan_id):
 
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
+    try:
+        with closing(sqlite3.connect(DATABASE)) as conn:
+            conn.row_factory = sqlite3.Row
 
-    cursor = conn.cursor()
+            scan = conn.execute("""
+                SELECT *
+                FROM scans
+                WHERE id = ?
+            """, (scan_id,)).fetchone()
+    except sqlite3.Error:
+        LOGGER.exception("Could not retrieve scan %s", scan_id)
+        return "Scan details are temporarily unavailable.", 503
 
-    cursor.execute("""
-        SELECT *
-        FROM scans
-        WHERE id = ?
-    """, (scan_id,))
-
-    scan = cursor.fetchone()
-
-    conn.close()
-
-    # -----------------------------------------------------
-    # SCAN NOT FOUND
-    # -----------------------------------------------------
-
+    # Scan not found
     if scan is None:
-
         return "Scan not found", 404
 
-    # -----------------------------------------------------
-    # RE-ANALYZE STORED JOB DESCRIPTION
-    # -----------------------------------------------------
-
+    # Re-analyze the stored description to retrieve red flags
     try:
-
-        analysis = predict_job(
-            scan["job_description"]
-        )
+        analysis = predict_job(scan["job_description"])
 
         red_flags = analysis.get(
             "red_flags",
             []
         )
 
-    except Exception:
-
+    except (ValueError, RuntimeError):
+        LOGGER.exception(
+            "Could not retrieve red flags for scan %s",
+            scan_id
+        )
         red_flags = []
-
-    # -----------------------------------------------------
-    # RENDER DETAILS
-    # -----------------------------------------------------
 
     return render_template(
         "scan_details.html",
@@ -552,7 +425,11 @@ def scan_details(scan_id):
 @app.route("/dashboard")
 def dashboard():
 
-    stats = get_dashboard_stats()
+    try:
+        stats = get_dashboard_stats()
+    except sqlite3.Error:
+        LOGGER.exception("Could not retrieve dashboard statistics")
+        return "Dashboard data is temporarily unavailable.", 503
 
     return render_template(
         "dashboard.html",
@@ -566,10 +443,6 @@ def dashboard():
 
 if __name__ == "__main__":
 
-    # Make sure database exists
-    init_database()
-
-    # Start Flask server
-    app.run(
-        debug=True
-    )
+    # The database is already initialized above.
+    # Debug mode is for local development only.
+    app.run(debug=True)
